@@ -1,0 +1,677 @@
+#![no_std]
+
+extern crate alloc;
+
+use alloc::{
+    alloc::{alloc, dealloc, realloc, Layout},
+    slice,
+};
+
+use core::fmt::{self, Debug, Display, Formatter};
+use core::mem::{self, MaybeUninit};
+use core::ptr::{self, swap, NonNull};
+use core::{
+    cmp,
+    ops::{Deref, DerefMut},
+};
+
+pub type Vec<T> = CraneVec<T, DynamicContainer<T, 16>>;
+pub type DynVec<T, const INLINE_SIZE: usize> = CraneVec<T, DynamicContainer<T, INLINE_SIZE>>;
+pub type InlineVec<T, const SIZE: usize> = CraneVec<T, InlineContainer<T, SIZE>>;
+pub type HeapVec<T> = CraneVec<T, HeapContainer<T>>;
+
+pub struct CraneVec<T, C: Container<Element = T>> {
+    container: C,
+}
+
+impl<T, const SIZE: usize> CraneVec<T, DynamicContainer<T, SIZE>> {
+    pub fn new() -> Self {
+        CraneVec {
+            container: DynamicContainer::<T, SIZE>::new(),
+        }
+    }
+}
+
+impl<T> CraneVec<T, InlineContainer<T, 16>> {
+    pub fn new() -> Self {
+        CraneVec {
+            container: InlineContainer::new(),
+        }
+    }
+}
+
+impl<T> CraneVec<T, HeapContainer<T>> {
+    pub fn new() -> Self {
+        CraneVec {
+            container: HeapContainer::new(),
+        }
+    }
+}
+
+impl<T, C: Container<Element = T>> Deref for CraneVec<T, C> {
+    type Target = C;
+
+    fn deref(&self) -> &Self::Target {
+        &self.container
+    }
+}
+
+impl<T, C: Container<Element = T>> DerefMut for CraneVec<T, C> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.container
+    }
+}
+
+impl<T, const SIZE: usize> Default for CraneVec<T, DynamicContainer<T, SIZE>> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub trait Container: DerefMut<Target = [Self::Element]> {
+    type Element;
+
+    fn push(&mut self, el: Self::Element) {
+        // TODO print error in panic
+        self.try_push(el).expect("could not allocate");
+    }
+
+    fn try_push(&mut self, el: Self::Element) -> InsertionResult<Self::Element>;
+
+    fn read_at(&self, pos: usize) -> Option<&Self::Element>;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn len(&self) -> usize;
+
+    fn capacity(&self) -> usize;
+
+    fn as_ptr(&self) -> *const Self::Element;
+
+    fn as_mut_ptr(&mut self) -> *mut Self::Element;
+}
+
+pub struct InlineContainer<T, const SIZE: usize> {
+    // TODO test dropping, expect all initialised values to be destructed but no more
+    data: [MaybeUninit<T>; SIZE],
+    len: usize,
+}
+
+impl<T, const SIZE: usize> Container for InlineContainer<T, SIZE> {
+    type Element = T;
+
+    fn try_push(&mut self, el: T) -> InsertionResult<T> {
+        if self.len < SIZE {
+            unsafe {
+                self.data[self.len].as_mut_ptr().write(el);
+            }
+            self.len += 1;
+            Ok(())
+        } else {
+            Err(InsertionError::AllocationError(
+                el,
+                AllocationError::CapacityExceeded,
+            ))
+        }
+    }
+
+    fn read_at(&self, pos: usize) -> Option<&T> {
+        if pos < self.len {
+            unsafe { Some(&*(self.data.get_unchecked(pos) as *const MaybeUninit<T> as *const T)) }
+        } else {
+            None
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn capacity(&self) -> usize {
+        SIZE
+    }
+
+    fn as_ptr(&self) -> *const T {
+        self.data.as_ptr() as *const T
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut T {
+        self.data.as_mut_ptr() as *mut T
+    }
+}
+
+impl<T, const SIZE: usize> Drop for InlineContainer<T, SIZE> {
+    fn drop(&mut self) {
+        unsafe {
+            let init =
+                &mut *(self.data[0..self.len].as_mut() as *mut [MaybeUninit<T>] as *mut [T]);
+            ptr::drop_in_place(init);
+        }
+    }
+}
+
+impl<T, const SIZE: usize> Deref for InlineContainer<T, SIZE> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        unsafe { slice::from_raw_parts(self.as_ptr(), self.len) }
+    }
+}
+
+impl<T, const SIZE: usize> DerefMut for InlineContainer<T, SIZE> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len) }
+    }
+}
+
+impl<T, const SIZE: usize> Default for InlineContainer<T, SIZE> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, const SIZE: usize> InlineContainer<T, SIZE> {
+    pub fn new() -> Self {
+        Self {
+            // SAFETY: An uninitialized `[MaybeUninit<_>; SIZE]` is valid.
+            // See (currently nightly) only [`uninit_array`](https://doc.rust-lang.org/stable/std/mem/union.MaybeUninit.html#method.uninit_array)
+            data: unsafe { MaybeUninit::<[MaybeUninit<T>; SIZE]>::uninit().assume_init() },
+            len: 0,
+        }
+    }
+}
+
+pub struct HeapContainer<T> {
+    ptr: NonNull<T>,
+    capacity: usize,
+    len: usize,
+}
+
+impl<T> Container for HeapContainer<T> {
+    type Element = T;
+
+    fn try_push(&mut self, el: T) -> InsertionResult<T> {
+        // TODO handle zero sized types
+
+        let curr_len = self.len;
+        if curr_len == self.capacity {
+            if let Err(e) = self.try_reserve(1) {
+                return Err(InsertionError::AllocationError(el, e));
+            }
+        }
+
+        // SAFETY:
+        // Length is always lower than the capacity, thus the pointer is in range of the allocated object.
+        unsafe { self.ptr.as_ptr().add(curr_len).write(el) };
+
+        self.len += 1;
+        Ok(())
+    }
+
+    fn read_at(&self, pos: usize) -> Option<&T> {
+        if pos < self.len {
+            unsafe { Some(&*self.ptr.as_ptr().add(pos)) }
+        } else {
+            None
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr.as_ptr()
+    }
+}
+
+// TODO may_dangle?
+impl<T> Drop for HeapContainer<T> {
+    fn drop(&mut self) {
+        unsafe {
+            if self.capacity > 0 {
+                ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len));
+                let layout = self.current_layout();
+                dealloc(self.ptr.as_ptr() as *mut u8, layout);
+            }
+        }
+    }
+}
+
+impl<T> Deref for HeapContainer<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        unsafe { slice::from_raw_parts(self.as_ptr(), self.len) }
+    }
+}
+
+impl<T> DerefMut for HeapContainer<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len) }
+    }
+}
+
+impl<T> Default for HeapContainer<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> HeapContainer<T> {
+    pub fn new() -> Self {
+        HeapContainer {
+            ptr: NonNull::dangling(),
+            capacity: 0,
+            len: 0,
+        }
+    }
+
+    // From std Vec:
+    // Skip to:
+    // - 8 if the element size is 1, because any heap allocators is likely
+    //   to round up a request of less than 8 bytes to at least 8 bytes.
+    // - 4 if elements are moderate-sized (<= 1 KiB).
+    // - 1 otherwise, to avoid wasting too much space for very short Vecs.
+    const MIN_CAP: usize = if mem::size_of::<T>() == 1 {
+        8
+    } else if mem::size_of::<T>() <= 1024 {
+        4
+    } else {
+        1
+    };
+
+    pub fn try_reserve(&mut self, additional_capacity: usize) -> AllocationResult {
+        // On 64-bit we just need to check for overflow since trying to allocate
+        // `> isize::MAX` bytes will surely fail. On 32-bit and 16-bit we need to add
+        // an extra guard for this in case we're running on a platform which can use
+        // all 4GB in user-space, e.g., PAE or x32.
+        let curr_capacity = self.capacity;
+        let required_capacity = curr_capacity
+            .checked_add(additional_capacity)
+            .ok_or(AllocationError::ArithmeticOverflow)?;
+        let new_capacity = cmp::max(
+            cmp::max(curr_capacity * 2, required_capacity),
+            Self::MIN_CAP,
+        );
+
+        let ptr = unsafe {
+            if curr_capacity == 0 {
+                let layout = Layout::array::<T>(new_capacity)
+                    .map_err(|_| AllocationError::ArithmeticOverflow)?;
+
+                // From std RawVec:
+                // On 64-bit we just need to check for overflow since trying to allocate
+                // `> isize::MAX` bytes will surely fail. On 32-bit and 16-bit we need to add
+                // an extra guard for this in case we're running on a platform which can use
+                // all 4GB in user-space, e.g., PAE or x32.
+                if layout.size() > isize::MAX as usize {
+                    return Err(AllocationError::ArithmeticOverflow);
+                }
+
+                alloc(layout)
+            } else {
+                let layout = self.current_layout();
+                realloc(
+                    self.ptr.as_ptr() as *mut u8,
+                    layout,
+                    new_capacity * mem::size_of::<T>(),
+                )
+            }
+        };
+        self.ptr = NonNull::new(ptr as *mut T).ok_or(AllocationError::OutOfMemery)?;
+        self.capacity = new_capacity;
+        Ok(())
+    }
+
+    #[inline]
+    fn current_layout(&self) -> Layout {
+        // SAFETY: should not overflow because if it would, we could not have allocated it
+        unsafe {
+            Layout::from_size_align_unchecked(
+                mem::size_of::<T>() * self.capacity,
+                mem::align_of::<T>(),
+            )
+        }
+    }
+}
+
+pub enum DynamicData<T, const INLINE_SIZE: usize> {
+    Inline(InlineContainer<T, INLINE_SIZE>),
+    Heap(HeapContainer<T>),
+}
+
+pub struct DynamicContainer<T, const INLINE_SIZE: usize> {
+    data: DynamicData<T, INLINE_SIZE>,
+}
+
+impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE> {
+    type Element = T;
+
+    fn try_push(&mut self, el: T) -> InsertionResult<T> {
+        match self.data {
+            DynamicData::Inline(ref mut container) => {
+                if let Err(e) = container.try_push(el) {
+                    let el = e.into_inner();
+                    let mut heap_container = HeapContainer {
+                        ptr: NonNull::dangling(),
+                        capacity: 0,
+                        // pushing to inline container only fails when len reaches capacity
+                        len: INLINE_SIZE,
+                    };
+
+                    // make sure the data is reallocated to the heap and increase the capacity by at least 1
+                    match heap_container.try_reserve(cmp::max(INLINE_SIZE * 2, INLINE_SIZE + 1)) {
+                        Ok(_) => {
+                            // Since the memory has already been reserved, this operation should always succeed.
+                            // But for the sake of panic safety, perform this opertation before swapping the array into the heap.
+                            heap_container.try_push(el)?;
+                            // Get a pointer to the slice of the heap allocation the array should be swapped into.
+                            let heap_slice = ptr::slice_from_raw_parts_mut(
+                                heap_container.ptr.as_ptr(),
+                                INLINE_SIZE,
+                            ) as *mut [T; INLINE_SIZE];
+                            // Can safely convert [MaybeUninit<T>] to [T; INLINE_SIZE] because the array has been fully initialised.
+                            let inline_slice = container.data.as_mut() as *mut [MaybeUninit<T>]
+                                as *mut [T; INLINE_SIZE];
+                            // SAFETY:
+                            // The array is fully initialised, otherwise pushing another element would not have failed, thus assuming all elements
+                            // in the array to be valid and swapping them into the heap allocation is safe. The unitialised memory of the heap
+                            // allocation is swapped into the array, which is safe because the array is of type [MaybeUninit<T>], thus does not
+                            // require its data to be initialised.
+                            unsafe { swap(heap_slice, inline_slice) };
+                            // make sure that the inline storage is marked to be empty, now that the array has been replaced with unitialized memory
+                            container.len = 0;
+                            self.data = DynamicData::Heap(heap_container);
+                        }
+                        Err(e) => return Err(InsertionError::AllocationError(el, e)),
+                    };
+                }
+            }
+            DynamicData::Heap(ref mut containter) => {
+                containter.try_push(el)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_at(&self, pos: usize) -> Option<&T> {
+        match self.data {
+            DynamicData::Inline(ref container) => container.read_at(pos),
+            DynamicData::Heap(ref container) => container.read_at(pos),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self.data {
+            DynamicData::Inline(ref container) => container.len(),
+            DynamicData::Heap(ref container) => container.len(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self.data {
+            DynamicData::Inline(ref container) => container.capacity(),
+            DynamicData::Heap(ref container) => container.capacity(),
+        }
+    }
+
+    fn as_ptr(&self) -> *const T {
+        match self.data {
+            DynamicData::Inline(ref container) => container.as_ptr(),
+            DynamicData::Heap(ref container) => container.as_ptr(),
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut T {
+        match self.data {
+            DynamicData::Inline(ref mut container) => container.as_mut_ptr(),
+            DynamicData::Heap(ref mut container) => container.as_mut_ptr(),
+        }
+    }
+}
+
+impl<T, const INLINE_SIZE: usize> Deref for DynamicContainer<T, INLINE_SIZE> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        unsafe { slice::from_raw_parts(self.as_ptr(), self.len()) }
+    }
+}
+
+impl<T, const INLINE_SIZE: usize> DerefMut for DynamicContainer<T, INLINE_SIZE> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
+    }
+}
+
+impl<T, const INLINE_SIZE: usize> Default for DynamicContainer<T, INLINE_SIZE> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, const INLINE_SIZE: usize> DynamicContainer<T, INLINE_SIZE> {
+    pub fn new() -> Self {
+        if INLINE_SIZE > 0 {
+            DynamicContainer {
+                data: DynamicData::Inline(InlineContainer::new()),
+            }
+        } else {
+            DynamicContainer {
+                data: DynamicData::Heap(HeapContainer::new()),
+            }
+        }
+    }
+}
+
+pub enum InsertionError<T> {
+    AllocationError(T, AllocationError),
+}
+
+impl<T> InsertionError<T> {
+    pub fn into_inner(self) -> T {
+        match self {
+            InsertionError::AllocationError(elem, ..) => elem,
+        }
+    }
+}
+
+impl<T> Debug for InsertionError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            InsertionError::AllocationError(.., ref e) => {
+                write!(f, "InsertionError::AllocationError: {}", e)
+            }
+        }
+    }
+}
+
+impl<T> Display for InsertionError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        <InsertionError<T> as Debug>::fmt(self, f)
+    }
+}
+
+#[derive(Debug)]
+pub enum AllocationError {
+    /// The capacity of the container has been exceeded and the container does not support resizing.
+    CapacityExceeded,
+    /// The heap allocator could not request more memory.
+    OutOfMemery,
+    /// Calculating byte offset resulted in arithmetic overflow, generally byte offset cannot be larger than `isize::MAX`.
+    ArithmeticOverflow,
+}
+
+impl Display for AllocationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            AllocationError::CapacityExceeded => write!(f, "CapacityExceeded"),
+            AllocationError::OutOfMemery => write!(f, "OutOfMemery"),
+            AllocationError::ArithmeticOverflow => write!(f, "ArithmeticOverflow"),
+        }
+    }
+}
+
+pub type AllocationResult = Result<(), AllocationError>;
+pub type InsertionResult<T> = Result<(), InsertionError<T>>;
+
+#[cfg(test)]
+mod tests {
+
+    extern crate std;
+
+    use crate::{Container, CraneVec, DynVec, HeapVec, InlineContainer, InlineVec, Vec};
+
+    struct PrintOnDrop {
+        val: usize,
+    }
+    impl PrintOnDrop {
+        fn new() -> Self {
+            Self { val: 7 }
+        }
+    }
+    impl Drop for PrintOnDrop {
+        fn drop(&mut self) {
+            std::eprintln!("Dropped {}", self.val);
+        }
+    }
+
+    #[test]
+    fn it_works() {
+        let instant = std::time::Instant::now();
+        let mut stdvec = std::vec::Vec::new();
+        stdvec.push(PrintOnDrop::new());
+        stdvec.push(PrintOnDrop::new());
+        stdvec.push(PrintOnDrop::new());
+        stdvec.push(PrintOnDrop::new());
+        stdvec.push(PrintOnDrop::new());
+        std::eprintln!("std vec nanos {}", instant.elapsed().as_nanos());
+        drop(stdvec);
+
+        let instant = std::time::Instant::now();
+        let mut vec = CraneVec::<PrintOnDrop, InlineContainer<PrintOnDrop, 16>>::new();
+        vec.push(PrintOnDrop::new());
+        vec.push(PrintOnDrop::new());
+        vec.push(PrintOnDrop::new());
+        vec.push(PrintOnDrop::new());
+        vec.push(PrintOnDrop::new());
+        std::eprintln!("cranevec nanos {}", instant.elapsed().as_nanos());
+        drop(vec);
+
+        InlineVec::<PrintOnDrop, 16>::new();
+    }
+
+    #[test]
+    fn test_heap() {
+        let instant = std::time::Instant::now();
+        let mut stdvec = std::vec::Vec::new();
+        stdvec.push(PrintOnDrop::new());
+        stdvec.push(PrintOnDrop::new());
+        stdvec.push(PrintOnDrop::new());
+        stdvec.push(PrintOnDrop::new());
+        stdvec.push(PrintOnDrop::new());
+        std::eprintln!("std vec nanos {}", instant.elapsed().as_nanos());
+        drop(stdvec);
+
+        let instant = std::time::Instant::now();
+        let mut vec = HeapVec::new();
+        vec.push(PrintOnDrop::new());
+        vec.push(PrintOnDrop::new());
+        vec.push(PrintOnDrop::new());
+        vec.push(PrintOnDrop::new());
+        vec.push(PrintOnDrop::new());
+        std::eprintln!("cranevec nanos {}", instant.elapsed().as_nanos());
+        drop(vec);
+
+        HeapVec::<PrintOnDrop>::new();
+    }
+
+    #[test]
+    fn test_heap_large() {
+        let instant = std::time::Instant::now();
+        let mut stdvec = std::vec::Vec::new();
+        for _ in 0..500000 {
+            stdvec.push(PrintOnDrop::new());
+        }
+        std::eprintln!("std vec nanos {}", instant.elapsed().as_nanos());
+        drop(stdvec);
+
+        let instant = std::time::Instant::now();
+        let mut vec = HeapVec::new();
+        for _ in 0..500000 {
+            vec.push(PrintOnDrop::new());
+        }
+        std::eprintln!("cranevec nanos {}", instant.elapsed().as_nanos());
+        drop(vec);
+
+        HeapVec::<PrintOnDrop>::new();
+    }
+
+    #[test]
+    fn test_dynamic() {
+        let instant = std::time::Instant::now();
+        let mut stdvec = std::vec::Vec::new();
+        for _ in 0..20 {
+            stdvec.push(PrintOnDrop::new());
+        }
+        std::eprintln!("std vec nanos {}", instant.elapsed().as_nanos());
+        drop(stdvec);
+
+        let instant = std::time::Instant::now();
+        let mut vec = Vec::new();
+        for _ in 0..20 {
+            vec.push(PrintOnDrop::new());
+        }
+        std::eprintln!("cranevec nanos {}", instant.elapsed().as_nanos());
+        drop(vec);
+
+        HeapVec::<PrintOnDrop>::new();
+    }
+
+    #[test]
+    fn test_get() {
+        let mut vec = DynVec::<usize, 16>::new();
+
+        for i in 0..15 {
+            vec.push(i);
+        }
+
+        assert_eq!(vec.len(), 15);
+        assert_eq!(vec.capacity(), 16);
+
+        for i in 0..20 {
+            if i < 15 {
+                assert_eq!(vec.get(i), Some(&i));
+            } else {
+                assert_eq!(vec.get(i), None);
+            }
+        }
+
+        for i in 15..=250 {
+            vec.push(i);
+        }
+
+        assert_eq!(vec.len(), 251);
+        assert_eq!(vec.capacity(), 256);
+
+        for i in 15..300 {
+            if i <= 250 {
+                assert_eq!(vec.get(i), Some(&i));
+            } else {
+                assert_eq!(vec.get(i), None);
+            }
+        }
+    }
+}
