@@ -291,11 +291,9 @@ impl<T> HeapContainer<T> {
         1
     };
 
+    const MAX_SLICE_BYTE_LEN: usize = isize::MAX as usize;
+
     pub fn try_reserve(&mut self, additional_capacity: usize) -> AllocationResult {
-        // On 64-bit we just need to check for overflow since trying to allocate
-        // `> isize::MAX` bytes will surely fail. On 32-bit and 16-bit we need to add
-        // an extra guard for this in case we're running on a platform which can use
-        // all 4GB in user-space, e.g., PAE or x32.
         let curr_capacity = self.capacity;
         let required_capacity = curr_capacity
             .checked_add(additional_capacity)
@@ -310,23 +308,36 @@ impl<T> HeapContainer<T> {
                 let layout = Layout::array::<T>(new_capacity)
                     .map_err(|_| AllocationError::ArithmeticOverflow)?;
 
-                // From std RawVec:
-                // On 64-bit we just need to check for overflow since trying to allocate
-                // `> isize::MAX` bytes will surely fail. On 32-bit and 16-bit we need to add
-                // an extra guard for this in case we're running on a platform which can use
-                // all 4GB in user-space, e.g., PAE or x32.
-                if layout.size() > isize::MAX as usize {
-                    return Err(AllocationError::ArithmeticOverflow);
+                if layout.size() > Self::MAX_SLICE_BYTE_LEN {
+                    if Self::MAX_SLICE_BYTE_LEN >= required_capacity {
+                        let layout = Layout::array::<T>(Self::MAX_SLICE_BYTE_LEN)
+                            .map_err(|_| AllocationError::ArithmeticOverflow)?;
+                        alloc(layout)
+                    } else {
+                        return Err(AllocationError::ArithmeticOverflow);
+                    }
+                } else {
+                    alloc(layout)
                 }
-
-                alloc(layout)
             } else {
                 let layout = self.current_layout();
-                realloc(
-                    self.ptr.as_ptr() as *mut u8,
-                    layout,
-                    new_capacity * mem::size_of::<T>(),
-                )
+                let new_size = new_capacity
+                    .checked_mul(mem::size_of::<T>())
+                    .ok_or(AllocationError::ArithmeticOverflow)?;
+
+                if new_size > Self::MAX_SLICE_BYTE_LEN {
+                    if Self::MAX_SLICE_BYTE_LEN >= required_capacity {
+                        realloc(
+                            self.ptr.as_ptr() as *mut u8,
+                            layout,
+                            Self::MAX_SLICE_BYTE_LEN,
+                        )
+                    } else {
+                        return Err(AllocationError::ArithmeticOverflow);
+                    }
+                } else {
+                    realloc(self.ptr.as_ptr() as *mut u8, layout, new_size)
+                }
             }
         };
         self.ptr = NonNull::new(ptr as *mut T).ok_or(AllocationError::OutOfMemory)?;
