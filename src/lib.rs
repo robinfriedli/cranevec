@@ -329,7 +329,7 @@ impl<T> HeapContainer<T> {
                 )
             }
         };
-        self.ptr = NonNull::new(ptr as *mut T).ok_or(AllocationError::OutOfMemery)?;
+        self.ptr = NonNull::new(ptr as *mut T).ok_or(AllocationError::OutOfMemory)?;
         self.capacity = new_capacity;
         Ok(())
     }
@@ -374,7 +374,7 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
                     match heap_container.try_reserve(cmp::max(INLINE_SIZE * 2, INLINE_SIZE + 1)) {
                         Ok(_) => {
                             // Since the memory has already been reserved, this operation should always succeed.
-                            // But for the sake of panic safety, perform this opertation before swapping the array into the heap.
+                            // But for the sake of panic safety, perform this operation before swapping the array into the heap.
                             heap_container.try_push(el)?;
                             // Get a pointer to the slice of the heap allocation the array should be swapped into.
                             let heap_slice = ptr::slice_from_raw_parts_mut(
@@ -386,11 +386,11 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
                                 as *mut [T; INLINE_SIZE];
                             // SAFETY:
                             // The array is fully initialised, otherwise pushing another element would not have failed, thus assuming all elements
-                            // in the array to be valid and swapping them into the heap allocation is safe. The unitialised memory of the heap
+                            // in the array to be valid and swapping them into the heap allocation is safe. The uninitialised memory of the heap
                             // allocation is swapped into the array, which is safe because the array is of type [MaybeUninit<T>], thus does not
                             // require its data to be initialised.
                             unsafe { swap(heap_slice, inline_slice) };
-                            // make sure that the inline storage is marked to be empty, now that the array has been replaced with unitialized memory
+                            // make sure that the inline storage is marked to be empty, now that the array has been replaced with uninitialised memory
                             container.len = 0;
                             self.data = DynamicData::Heap(heap_container);
                         }
@@ -398,8 +398,8 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
                     };
                 }
             }
-            DynamicData::Heap(ref mut containter) => {
-                containter.try_push(el)?;
+            DynamicData::Heap(ref mut container) => {
+                container.try_push(el)?;
             }
         }
 
@@ -509,7 +509,7 @@ pub enum AllocationError {
     /// The capacity of the container has been exceeded and the container does not support resizing.
     CapacityExceeded,
     /// The heap allocator could not request more memory.
-    OutOfMemery,
+    OutOfMemory,
     /// Calculating byte offset resulted in arithmetic overflow, generally byte offset cannot be larger than `isize::MAX`.
     ArithmeticOverflow,
 }
@@ -518,7 +518,7 @@ impl Display for AllocationError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             AllocationError::CapacityExceeded => write!(f, "CapacityExceeded"),
-            AllocationError::OutOfMemery => write!(f, "OutOfMemery"),
+            AllocationError::OutOfMemory => write!(f, "OutOfMemory"),
             AllocationError::ArithmeticOverflow => write!(f, "ArithmeticOverflow"),
         }
     }
