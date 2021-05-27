@@ -32,7 +32,7 @@ impl<T, const SIZE: usize> CraneVec<T, DynamicContainer<T, SIZE>> {
     }
 }
 
-impl<T> CraneVec<T, InlineContainer<T, 16>> {
+impl<T, const SIZE: usize> CraneVec<T, InlineContainer<T, SIZE>> {
     pub fn new() -> Self {
         CraneVec {
             container: InlineContainer::new(),
