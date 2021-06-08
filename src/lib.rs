@@ -685,4 +685,19 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_iter() {
+        let mut vec = Vec::new();
+
+        for i in 0..10000 {
+            vec.push(i);
+        }
+
+        let mut idx = 0;
+        for i in vec.iter() {
+            assert_eq!(*i, idx);
+            idx += 1;
+        }
+    }
 }
