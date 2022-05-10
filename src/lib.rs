@@ -842,6 +842,7 @@ mod tests {
     extern crate std;
 
     use crate::{Container, CraneVec, DynVec, HeapVec, InlineContainer, InlineVec, Vec};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct PrintOnDrop {
         val: usize,
@@ -857,8 +858,39 @@ mod tests {
         }
     }
 
+    struct IncrementOnDrop<'a> {
+        counter: &'a AtomicUsize,
+    }
+
+    impl<'a> IncrementOnDrop<'a> {
+        fn new(counter: &'a AtomicUsize) -> Self {
+            Self { counter }
+        }
+    }
+
+    impl<'a> Drop for IncrementOnDrop<'a> {
+        fn drop(&mut self) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     #[test]
     fn it_works() {
+        let mut vec = CraneVec::<IncrementOnDrop, InlineContainer<IncrementOnDrop, 16>>::new();
+        let counter = AtomicUsize::new(0);
+        vec.push(IncrementOnDrop::new(&counter));
+        vec.push(IncrementOnDrop::new(&counter));
+        vec.push(IncrementOnDrop::new(&counter));
+        vec.push(IncrementOnDrop::new(&counter));
+        vec.push(IncrementOnDrop::new(&counter));
+        assert_eq!(vec.len(), 5);
+        drop(vec);
+        assert_eq!(counter.load(Ordering::Relaxed), 5);
+    }
+
+    #[ignore]
+    #[test]
+    fn it_works_bench() {
         let instant = std::time::Instant::now();
         let mut stdvec = std::vec::Vec::new();
         stdvec.push(PrintOnDrop::new());
@@ -884,6 +916,21 @@ mod tests {
 
     #[test]
     fn test_heap() {
+        let mut vec = HeapVec::new();
+        let counter = AtomicUsize::new(0);
+        vec.push(IncrementOnDrop::new(&counter));
+        vec.push(IncrementOnDrop::new(&counter));
+        vec.push(IncrementOnDrop::new(&counter));
+        vec.push(IncrementOnDrop::new(&counter));
+        vec.push(IncrementOnDrop::new(&counter));
+        assert_eq!(vec.len(), 5);
+        drop(vec);
+        assert_eq!(counter.load(Ordering::Relaxed), 5);
+    }
+
+    #[ignore]
+    #[test]
+    fn test_heap_bench() {
         let instant = std::time::Instant::now();
         let mut stdvec = std::vec::Vec::new();
         stdvec.push(PrintOnDrop::new());
@@ -909,6 +956,19 @@ mod tests {
 
     #[test]
     fn test_heap_large() {
+        let mut vec = HeapVec::new();
+        let counter = AtomicUsize::new(0);
+        for _ in 0..500000 {
+            vec.push(IncrementOnDrop::new(&counter));
+        }
+        assert_eq!(vec.len(), 500000);
+        drop(vec);
+        assert_eq!(counter.load(Ordering::Relaxed), 500000);
+    }
+
+    #[ignore]
+    #[test]
+    fn test_heap_large_bench() {
         let instant = std::time::Instant::now();
         let mut stdvec = std::vec::Vec::new();
         for _ in 0..500000 {
@@ -930,6 +990,19 @@ mod tests {
 
     #[test]
     fn test_dynamic() {
+        let mut vec = DynVec::<IncrementOnDrop, 16>::new();
+        let counter = AtomicUsize::new(0);
+        for _ in 0..20 {
+            vec.push(IncrementOnDrop::new(&counter));
+        }
+        assert_eq!(vec.len(), 20);
+        drop(vec);
+        assert_eq!(counter.load(Ordering::Relaxed), 20);
+    }
+
+    #[ignore]
+    #[test]
+    fn test_dynamic_bench() {
         let instant = std::time::Instant::now();
         let mut stdvec = std::vec::Vec::new();
         for _ in 0..20 {
