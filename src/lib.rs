@@ -72,8 +72,7 @@ pub trait Container: DerefMut<Target = [Self::Element]> {
     type Element;
 
     fn push(&mut self, el: Self::Element) {
-        // TODO print error in panic
-        self.try_push(el).expect("could not allocate");
+        self.try_push(el).expect("Could not allocate element due to container capacity constraints or allocation failure");
     }
 
     fn try_push(&mut self, el: Self::Element) -> InsertionResult<Self::Element>;
@@ -91,6 +90,84 @@ pub trait Container: DerefMut<Target = [Self::Element]> {
     fn as_ptr(&self) -> *const Self::Element;
 
     fn as_mut_ptr(&mut self) -> *mut Self::Element;
+
+    /// Reserves the minimum capacity required for `additional` more elements, favouring the nearest multiple of 2.
+    ///
+    /// Does nothing if the current capacity already suffices.
+    ///
+    /// Unlike [`Container::try_reserve_additional`] this adds `additional` to the current length,
+    /// not the capacity.
+    ///
+    /// Returns an [`AllocationError`] if the required `additional` capacity could not be allocated.
+    fn try_reserve(&mut self, additional: usize) -> AllocationResult;
+
+    /// Reserves the minimum capacity required for `additional` more elements, favouring the nearest multiple of 2.
+    ///
+    /// Does nothing if the current capacity already suffices.
+    ///
+    /// Unlike [`Container::try_reserve_additional`] this adds `additional` to the current length,
+    /// not the capacity.
+    ///
+    /// Panics if the required `additional` capacity could not be allocated.
+    fn reserve(&mut self, additional: usize) {
+        self.try_reserve(additional)
+            .expect("Could not allocate additional capacity");
+    }
+
+    /// Reserves the exact capacity required for `additional` more elements.
+    ///
+    /// Does nothing if the current capacity already suffices.
+    ///
+    /// Unlike [`Container::try_reserve_additional`] this adds `additional` to the current length,
+    /// not the capacity.
+    ///
+    /// Returns an [`AllocationError`] if the required `additional` capacity could not be allocated.
+    fn try_reserve_exact(&mut self, additional: usize) -> AllocationResult;
+
+    /// Reserves the exact capacity required for `additional` more elements.
+    ///
+    /// Does nothing if the current capacity already suffices.
+    ///
+    /// Unlike [`Container::try_reserve_additional`] this adds `additional` to the current length,
+    /// not the capacity.
+    ///
+    /// Panics if the required `additional` capacity could not be allocated.
+    fn reserve_exact(&mut self, additional: usize) {
+        self.try_reserve_exact(additional)
+            .expect("Could not allocate additional capacity")
+    }
+
+    /// Increases the capacity by at least `additional_capacity`, favouring the nearest multiple of 2.
+    ///
+    /// Unlike [`Container::try_reserve`] this adds the `additional_capacity` to the current capacity,
+    /// not the length.
+    ///
+    /// Returns an [`AllocationError`] if the required `additional_capacity` could not be allocated.
+    fn try_reserve_additional(&mut self, additional_capacity: usize) -> AllocationResult;
+
+    /// Increases the capacity by at least `additional_capacity`, favouring the nearest multiple of 2.
+    ///
+    /// Unlike [`Container::try_reserve`] this adds the `additional_capacity` to the current capacity,
+    /// not the length.
+    ///
+    /// Panics if the required `additional_capacity` could not be allocated.
+    fn reserve_additional(&mut self, additional_capacity: usize) {
+        self.try_reserve_additional(additional_capacity)
+            .expect("Could not allocate additional capacity")
+    }
+
+    /// Increases the capacity by exactly `additional_capacity`.
+    ///
+    /// Returns an [`AllocationError`] if the required `additional_capacity` could not be allocated.
+    fn try_reserve_additional_exact(&mut self, additional_capacity: usize) -> AllocationResult;
+
+    /// Increases the capacity by exactly `additional_capacity`.
+    ///
+    /// Panics if the required `additional_capacity` could not be allocated.
+    fn reserve_additional_exact(&mut self, additional_capacity: usize) {
+        self.try_reserve_additional_exact(additional_capacity)
+            .expect("Could not allocate additional capacity")
+    }
 }
 
 pub struct InlineContainer<T, const SIZE: usize> {
@@ -139,6 +216,48 @@ impl<T, const SIZE: usize> Container for InlineContainer<T, SIZE> {
 
     fn as_mut_ptr(&mut self) -> *mut T {
         self.data.as_mut_ptr() as *mut T
+    }
+
+    fn try_reserve(&mut self, additional: usize) -> AllocationResult {
+        let required_capacity = self
+            .len
+            .checked_add(additional)
+            .ok_or(AllocationError::ArithmeticOverflow)?;
+
+        if required_capacity > SIZE {
+            Err(AllocationError::CapacityExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_reserve_exact(&mut self, additional: usize) -> AllocationResult {
+        let required_capacity = self
+            .len
+            .checked_add(additional)
+            .ok_or(AllocationError::ArithmeticOverflow)?;
+
+        if required_capacity > SIZE {
+            Err(AllocationError::CapacityExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_reserve_additional(&mut self, additional_capacity: usize) -> AllocationResult {
+        if additional_capacity > 0 {
+            Err(AllocationError::CapacityExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_reserve_additional_exact(&mut self, additional_capacity: usize) -> AllocationResult {
+        if additional_capacity > 0 {
+            Err(AllocationError::CapacityExceeded)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -197,7 +316,7 @@ impl<T> Container for HeapContainer<T> {
 
         let curr_len = self.len;
         if curr_len == self.capacity {
-            if let Err(e) = self.try_reserve(1) {
+            if let Err(e) = self.try_reserve_additional(1) {
                 return Err(InsertionError::AllocationError(el, e));
             }
         }
@@ -232,6 +351,60 @@ impl<T> Container for HeapContainer<T> {
 
     fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr.as_ptr()
+    }
+
+    fn try_reserve(&mut self, additional: usize) -> AllocationResult {
+        let curr_capacity = self.capacity;
+        let required_capacity = self
+            .len
+            .checked_add(additional)
+            .ok_or(AllocationError::ArithmeticOverflow)?;
+        let new_capacity = cmp::max(
+            cmp::max(curr_capacity * 2, required_capacity),
+            Self::MIN_CAP,
+        );
+
+        if required_capacity > curr_capacity {
+            self.try_reserve_capacity(curr_capacity, new_capacity, required_capacity)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_reserve_exact(&mut self, additional: usize) -> AllocationResult {
+        let curr_capacity = self.capacity;
+        let required_capacity = self
+            .len
+            .checked_add(additional)
+            .ok_or(AllocationError::ArithmeticOverflow)?;
+
+        if required_capacity > curr_capacity {
+            self.try_reserve_capacity(curr_capacity, required_capacity, required_capacity)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_reserve_additional(&mut self, additional_capacity: usize) -> AllocationResult {
+        let curr_capacity = self.capacity;
+        let required_capacity = curr_capacity
+            .checked_add(additional_capacity)
+            .ok_or(AllocationError::ArithmeticOverflow)?;
+        let new_capacity = cmp::max(
+            cmp::max(curr_capacity * 2, required_capacity),
+            Self::MIN_CAP,
+        );
+
+        self.try_reserve_capacity(curr_capacity, new_capacity, required_capacity)
+    }
+
+    fn try_reserve_additional_exact(&mut self, additional_capacity: usize) -> AllocationResult {
+        let curr_capacity = self.capacity;
+        let required_capacity = curr_capacity
+            .checked_add(additional_capacity)
+            .ok_or(AllocationError::ArithmeticOverflow)?;
+
+        self.try_reserve_capacity(curr_capacity, required_capacity, required_capacity)
     }
 }
 
@@ -293,16 +466,14 @@ impl<T> HeapContainer<T> {
 
     const MAX_SLICE_BYTE_LEN: usize = isize::MAX as usize;
 
-    pub fn try_reserve(&mut self, additional_capacity: usize) -> AllocationResult {
-        let curr_capacity = self.capacity;
-        let required_capacity = curr_capacity
-            .checked_add(additional_capacity)
-            .ok_or(AllocationError::ArithmeticOverflow)?;
-        let new_capacity = cmp::max(
-            cmp::max(curr_capacity * 2, required_capacity),
-            Self::MIN_CAP,
-        );
-
+    fn try_reserve_capacity(
+        &mut self,
+        curr_capacity: usize,
+        new_capacity: usize,
+        required_capacity: usize,
+    ) -> AllocationResult {
+        // SAFETY:
+        // Layout is current array layout and allocated / reallocated size is multiple of size of T and <= isize::MAX
         let ptr = unsafe {
             if curr_capacity == 0 {
                 let layout = Layout::array::<T>(new_capacity)
@@ -325,8 +496,11 @@ impl<T> HeapContainer<T> {
                     .checked_mul(mem::size_of::<T>())
                     .ok_or(AllocationError::ArithmeticOverflow)?;
 
-                if new_size > Self::MAX_SLICE_BYTE_LEN {
-                    if Self::MAX_SLICE_BYTE_LEN >= required_capacity {
+                if new_size > Self::MAX_SLICE_BYTE_LEN && new_capacity > required_capacity {
+                    let required_size = required_capacity
+                        .checked_mul(mem::size_of::<T>())
+                        .ok_or(AllocationError::ArithmeticOverflow)?;
+                    if Self::MAX_SLICE_BYTE_LEN >= required_size {
                         realloc(
                             self.ptr.as_ptr() as *mut u8,
                             layout,
@@ -366,6 +540,55 @@ pub struct DynamicContainer<T, const INLINE_SIZE: usize> {
     data: DynamicData<T, INLINE_SIZE>,
 }
 
+impl<T, const INLINE_SIZE: usize> DynamicContainer<T, INLINE_SIZE> {
+    pub fn try_move_to_heap(&mut self) -> AllocationResult {
+        match self.data {
+            DynamicData::Inline(ref mut container) => {
+                Self::move_inline_to_heap(container)?;
+                Ok(())
+            }
+            DynamicData::Heap(_) => Ok(()),
+        }
+    }
+
+    fn move_inline_to_heap(
+        container: &mut InlineContainer<T, INLINE_SIZE>,
+    ) -> Result<HeapContainer<T>, AllocationError> {
+        let mut heap_container = HeapContainer {
+            ptr: NonNull::dangling(),
+            capacity: 0,
+            // pushing to inline container only fails when len reaches capacity
+            len: INLINE_SIZE,
+        };
+
+        // make sure the data is reallocated to the heap and increase the capacity by at least 1
+        heap_container.try_reserve_additional(cmp::max(INLINE_SIZE * 2, INLINE_SIZE + 1))?;
+        unsafe { Self::move_inline_to_reserved_heap(container, heap_container) }
+    }
+
+    // SAFETY: caller must make sure the HeapContainer has allocated the required capacity to store INLINE_SIZE elements.
+    unsafe fn move_inline_to_reserved_heap(
+        container: &mut InlineContainer<T, INLINE_SIZE>,
+        heap_container: HeapContainer<T>,
+    ) -> Result<HeapContainer<T>, AllocationError> {
+        // Get a pointer to the slice of the heap allocation the array should be swapped into.
+        let heap_slice = ptr::slice_from_raw_parts_mut(heap_container.ptr.as_ptr(), INLINE_SIZE)
+            as *mut [T; INLINE_SIZE];
+        // Can safely convert [MaybeUninit<T>] to [T; INLINE_SIZE] because the array has been fully initialised.
+        let inline_slice =
+            container.data.as_mut() as *mut [MaybeUninit<T>] as *mut [T; INLINE_SIZE];
+        // SAFETY:
+        // The array is fully initialised, otherwise pushing another element would not have failed, thus assuming all elements
+        // in the array to be valid and swapping them into the heap allocation is safe. The uninitialised memory of the heap
+        // allocation is swapped into the array, which is safe because the array is of type [MaybeUninit<T>], thus does not
+        // require its data to be initialised.
+        swap(heap_slice, inline_slice);
+        // make sure that the inline storage is marked to be empty, now that the array has been replaced with uninitialised memory
+        container.len = 0;
+        Ok(heap_container)
+    }
+}
+
 impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE> {
     type Element = T;
 
@@ -374,38 +597,15 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
             DynamicData::Inline(ref mut container) => {
                 if let Err(e) = container.try_push(el) {
                     let el = e.into_inner();
-                    let mut heap_container = HeapContainer {
-                        ptr: NonNull::dangling(),
-                        capacity: 0,
-                        // pushing to inline container only fails when len reaches capacity
-                        len: INLINE_SIZE,
-                    };
-
-                    // make sure the data is reallocated to the heap and increase the capacity by at least 1
-                    match heap_container.try_reserve(cmp::max(INLINE_SIZE * 2, INLINE_SIZE + 1)) {
-                        Ok(_) => {
+                    match Self::move_inline_to_heap(container) {
+                        Ok(mut heap_container) => {
                             // Since the memory has already been reserved, this operation should always succeed.
-                            // But for the sake of panic safety, perform this operation before swapping the array into the heap.
-                            heap_container.try_push(el)?;
-                            // Get a pointer to the slice of the heap allocation the array should be swapped into.
-                            let heap_slice = ptr::slice_from_raw_parts_mut(
-                                heap_container.ptr.as_ptr(),
-                                INLINE_SIZE,
-                            ) as *mut [T; INLINE_SIZE];
-                            // Can safely convert [MaybeUninit<T>] to [T; INLINE_SIZE] because the array has been fully initialised.
-                            let inline_slice = container.data.as_mut() as *mut [MaybeUninit<T>]
-                                as *mut [T; INLINE_SIZE];
-                            // SAFETY:
-                            // The array is fully initialised, otherwise pushing another element would not have failed, thus assuming all elements
-                            // in the array to be valid and swapping them into the heap allocation is safe. The uninitialised memory of the heap
-                            // allocation is swapped into the array, which is safe because the array is of type [MaybeUninit<T>], thus does not
-                            // require its data to be initialised.
-                            unsafe { swap(heap_slice, inline_slice) };
-                            // make sure that the inline storage is marked to be empty, now that the array has been replaced with uninitialised memory
-                            container.len = 0;
+                            heap_container.push(el);
                             self.data = DynamicData::Heap(heap_container);
                         }
-                        Err(e) => return Err(InsertionError::AllocationError(el, e)),
+                        Err(allocation_error) => {
+                            return Err(InsertionError::AllocationError(el, allocation_error))
+                        }
                     };
                 }
             }
@@ -426,15 +626,15 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
 
     fn len(&self) -> usize {
         match self.data {
-            DynamicData::Inline(ref container) => container.len(),
-            DynamicData::Heap(ref container) => container.len(),
+            DynamicData::Inline(ref container) => container.len,
+            DynamicData::Heap(ref container) => container.len,
         }
     }
 
     fn capacity(&self) -> usize {
         match self.data {
-            DynamicData::Inline(ref container) => container.capacity(),
-            DynamicData::Heap(ref container) => container.capacity(),
+            DynamicData::Inline(_) => INLINE_SIZE,
+            DynamicData::Heap(ref container) => container.capacity,
         }
     }
 
@@ -449,6 +649,104 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
         match self.data {
             DynamicData::Inline(ref mut container) => container.as_mut_ptr(),
             DynamicData::Heap(ref mut container) => container.as_mut_ptr(),
+        }
+    }
+
+    fn try_reserve(&mut self, additional: usize) -> AllocationResult {
+        match self.data {
+            DynamicData::Inline(ref mut container) => {
+                let required_capacity = container
+                    .len
+                    .checked_add(additional)
+                    .ok_or(AllocationError::ArithmeticOverflow)?;
+
+                if required_capacity > INLINE_SIZE {
+                    let mut heap_container = HeapContainer {
+                        ptr: NonNull::dangling(),
+                        capacity: 0,
+                        len: container.len,
+                    };
+
+                    heap_container.try_reserve(additional)?;
+                    let heap_container =
+                        unsafe { Self::move_inline_to_reserved_heap(container, heap_container) }?;
+                    self.data = DynamicData::Heap(heap_container);
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            DynamicData::Heap(ref mut container) => container.try_reserve(additional),
+        }
+    }
+
+    fn try_reserve_exact(&mut self, additional: usize) -> AllocationResult {
+        match self.data {
+            DynamicData::Inline(ref mut container) => {
+                let required_capacity = container
+                    .len
+                    .checked_add(additional)
+                    .ok_or(AllocationError::ArithmeticOverflow)?;
+
+                if required_capacity > INLINE_SIZE {
+                    let mut heap_container = HeapContainer {
+                        ptr: NonNull::dangling(),
+                        capacity: 0,
+                        len: container.len,
+                    };
+
+                    heap_container.try_reserve_exact(additional)?;
+                    let heap_container =
+                        unsafe { Self::move_inline_to_reserved_heap(container, heap_container) }?;
+                    self.data = DynamicData::Heap(heap_container);
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            DynamicData::Heap(ref mut container) => container.try_reserve_exact(additional),
+        }
+    }
+
+    fn try_reserve_additional(&mut self, additional_capacity: usize) -> AllocationResult {
+        match self.data {
+            DynamicData::Inline(ref mut container) => {
+                let mut heap_container = HeapContainer {
+                    ptr: NonNull::dangling(),
+                    capacity: 0,
+                    len: container.len,
+                };
+
+                heap_container.try_reserve_additional(INLINE_SIZE + additional_capacity)?;
+                let heap_container =
+                    unsafe { Self::move_inline_to_reserved_heap(container, heap_container) }?;
+                self.data = DynamicData::Heap(heap_container);
+                Ok(())
+            }
+            DynamicData::Heap(ref mut container) => {
+                container.try_reserve_additional(additional_capacity)
+            }
+        }
+    }
+
+    fn try_reserve_additional_exact(&mut self, additional_capacity: usize) -> AllocationResult {
+        match self.data {
+            DynamicData::Inline(ref mut container) => {
+                let mut heap_container = HeapContainer {
+                    ptr: NonNull::dangling(),
+                    capacity: 0,
+                    len: container.len,
+                };
+
+                heap_container.try_reserve_additional_exact(INLINE_SIZE + additional_capacity)?;
+                let heap_container =
+                    unsafe { Self::move_inline_to_reserved_heap(container, heap_container) }?;
+                self.data = DynamicData::Heap(heap_container);
+                Ok(())
+            }
+            DynamicData::Heap(ref mut container) => {
+                container.try_reserve_additional_exact(additional_capacity)
+            }
         }
     }
 }
@@ -699,5 +997,93 @@ mod tests {
             assert_eq!(*i, idx);
             idx += 1;
         }
+    }
+
+    #[should_panic(
+        expected = "Could not allocate element due to container capacity constraints or allocation failure: InsertionError::AllocationError: CapacityExceeded"
+    )]
+    #[test]
+    fn test_inline_overflow() {
+        let mut vec = InlineVec::<i32, 4>::new();
+
+        for i in 0..5 {
+            vec.push(i);
+        }
+    }
+
+    #[test]
+    fn test_reserve() {
+        let mut vec = HeapVec::<i32>::new();
+
+        vec.reserve(16);
+        assert_eq!(vec.capacity(), 16);
+
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+        assert_eq!(vec.capacity(), 16);
+        vec.reserve_exact(10);
+        assert_eq!(vec.capacity(), 16);
+
+        vec.reserve_additional(10);
+        assert_eq!(vec.capacity(), 32);
+
+        vec.reserve_additional_exact(5);
+        assert_eq!(vec.capacity(), 37);
+
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+        assert_eq!(vec.capacity(), 37);
+
+        assert_eq!(vec.iter().sum::<i32>(), 10);
+    }
+
+    #[test]
+    fn test_reserve_dynamic() {
+        let mut vec = DynVec::<i32, 16>::new();
+
+        assert_eq!(vec.capacity(), 16);
+        vec.reserve(16);
+        assert_eq!(vec.capacity(), 16);
+
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+
+        assert_eq!(vec.capacity(), 16);
+        assert_eq!(vec.len(), 5);
+        vec.reserve(10);
+        assert_eq!(vec.capacity(), 16);
+        assert_eq!(vec.len(), 5);
+
+        vec.reserve(16);
+        assert_eq!(vec.capacity(), 21);
+        assert_eq!(vec.len(), 5);
+
+        for i in vec.iter() {
+            assert_eq!(*i, 1);
+        }
+        assert_eq!(vec.iter().sum::<i32>(), 5);
+
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+        vec.push(1);
+
+        assert_eq!(vec.capacity(), 21);
+        assert_eq!(vec.len(), 10);
+
+        for i in vec.iter() {
+            assert_eq!(*i, 1);
+        }
+        assert_eq!(vec.iter().sum::<i32>(), 10);
     }
 }
