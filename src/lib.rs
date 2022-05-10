@@ -171,7 +171,6 @@ pub trait Container: DerefMut<Target = [Self::Element]> {
 }
 
 pub struct InlineContainer<T, const SIZE: usize> {
-    // TODO test dropping, expect all initialised values to be destructed but no more
     data: [MaybeUninit<T>; SIZE],
     len: usize,
 }
@@ -180,9 +179,9 @@ impl<T, const SIZE: usize> Container for InlineContainer<T, SIZE> {
     type Element = T;
 
     fn try_push(&mut self, el: T) -> InsertionResult<T> {
-        if self.len < SIZE {
+        if self.len < self.capacity() {
             unsafe {
-                self.data[self.len].as_mut_ptr().write(el);
+                self.data.get_unchecked_mut(self.len).as_mut_ptr().write(el);
             }
             self.len += 1;
             Ok(())
@@ -207,7 +206,11 @@ impl<T, const SIZE: usize> Container for InlineContainer<T, SIZE> {
     }
 
     fn capacity(&self) -> usize {
-        SIZE
+        if mem::size_of::<T>() == 0 {
+            usize::MAX
+        } else {
+            SIZE
+        }
     }
 
     fn as_ptr(&self) -> *const T {
@@ -264,8 +267,8 @@ impl<T, const SIZE: usize> Container for InlineContainer<T, SIZE> {
 impl<T, const SIZE: usize> Drop for InlineContainer<T, SIZE> {
     fn drop(&mut self) {
         unsafe {
-            let init =
-                &mut *(self.data[0..self.len].as_mut() as *mut [MaybeUninit<T>] as *mut [T]);
+            let init = &mut *(slice::from_raw_parts_mut(self.data.as_mut_ptr(), self.len)
+                as *mut [MaybeUninit<T>] as *mut [T]);
             ptr::drop_in_place(init);
         }
     }
@@ -312,10 +315,8 @@ impl<T> Container for HeapContainer<T> {
     type Element = T;
 
     fn try_push(&mut self, el: T) -> InsertionResult<T> {
-        // TODO handle zero sized types
-
         let curr_len = self.len;
-        if curr_len == self.capacity {
+        if curr_len == self.capacity() {
             if let Err(e) = self.try_reserve_additional(1) {
                 return Err(InsertionError::AllocationError(el, e));
             }
@@ -342,7 +343,11 @@ impl<T> Container for HeapContainer<T> {
     }
 
     fn capacity(&self) -> usize {
-        self.capacity
+        if mem::size_of::<T>() == 0 {
+            usize::MAX
+        } else {
+            self.capacity
+        }
     }
 
     fn as_ptr(&self) -> *const T {
@@ -365,7 +370,7 @@ impl<T> Container for HeapContainer<T> {
         );
 
         if required_capacity > curr_capacity {
-            self.try_reserve_capacity(curr_capacity, new_capacity, required_capacity)
+            self.try_reserve_capacity(new_capacity, required_capacity)
         } else {
             Ok(())
         }
@@ -379,7 +384,7 @@ impl<T> Container for HeapContainer<T> {
             .ok_or(AllocationError::ArithmeticOverflow)?;
 
         if required_capacity > curr_capacity {
-            self.try_reserve_capacity(curr_capacity, required_capacity, required_capacity)
+            self.try_reserve_capacity(required_capacity, required_capacity)
         } else {
             Ok(())
         }
@@ -395,7 +400,7 @@ impl<T> Container for HeapContainer<T> {
             Self::MIN_CAP,
         );
 
-        self.try_reserve_capacity(curr_capacity, new_capacity, required_capacity)
+        self.try_reserve_capacity(new_capacity, required_capacity)
     }
 
     fn try_reserve_additional_exact(&mut self, additional_capacity: usize) -> AllocationResult {
@@ -404,7 +409,7 @@ impl<T> Container for HeapContainer<T> {
             .checked_add(additional_capacity)
             .ok_or(AllocationError::ArithmeticOverflow)?;
 
-        self.try_reserve_capacity(curr_capacity, required_capacity, required_capacity)
+        self.try_reserve_capacity(required_capacity, required_capacity)
     }
 }
 
@@ -412,9 +417,8 @@ impl<T> Container for HeapContainer<T> {
 impl<T> Drop for HeapContainer<T> {
     fn drop(&mut self) {
         unsafe {
-            if self.capacity > 0 {
-                ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len));
-                let layout = self.current_layout();
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len));
+            if let Some(layout) = self.current_layout() {
                 dealloc(self.ptr.as_ptr() as *mut u8, layout);
             }
         }
@@ -468,49 +472,50 @@ impl<T> HeapContainer<T> {
 
     fn try_reserve_capacity(
         &mut self,
-        curr_capacity: usize,
         new_capacity: usize,
         required_capacity: usize,
     ) -> AllocationResult {
         // SAFETY:
         // Layout is current array layout and allocated / reallocated size is multiple of size of T and <= isize::MAX
         let ptr = unsafe {
-            if curr_capacity == 0 {
-                let layout = Layout::array::<T>(new_capacity)
-                    .map_err(|_| AllocationError::ArithmeticOverflow)?;
-
-                if layout.size() > Self::MAX_SLICE_BYTE_LEN {
-                    if Self::MAX_SLICE_BYTE_LEN >= required_capacity {
-                        let layout = Layout::array::<T>(Self::MAX_SLICE_BYTE_LEN)
-                            .map_err(|_| AllocationError::ArithmeticOverflow)?;
-                        alloc(layout)
-                    } else {
-                        return Err(AllocationError::ArithmeticOverflow);
-                    }
-                } else {
-                    alloc(layout)
-                }
-            } else {
-                let layout = self.current_layout();
-                let new_size = new_capacity
-                    .checked_mul(mem::size_of::<T>())
-                    .ok_or(AllocationError::ArithmeticOverflow)?;
-
-                if new_size > Self::MAX_SLICE_BYTE_LEN && new_capacity > required_capacity {
-                    let required_size = required_capacity
+            match self.current_layout() {
+                Some(layout) => {
+                    let new_size = new_capacity
                         .checked_mul(mem::size_of::<T>())
                         .ok_or(AllocationError::ArithmeticOverflow)?;
-                    if Self::MAX_SLICE_BYTE_LEN >= required_size {
-                        realloc(
-                            self.ptr.as_ptr() as *mut u8,
-                            layout,
-                            Self::MAX_SLICE_BYTE_LEN,
-                        )
+
+                    if new_size > Self::MAX_SLICE_BYTE_LEN && new_capacity > required_capacity {
+                        let required_size = required_capacity
+                            .checked_mul(mem::size_of::<T>())
+                            .ok_or(AllocationError::ArithmeticOverflow)?;
+                        if Self::MAX_SLICE_BYTE_LEN >= required_size {
+                            realloc(
+                                self.ptr.as_ptr() as *mut u8,
+                                layout,
+                                Self::MAX_SLICE_BYTE_LEN,
+                            )
+                        } else {
+                            return Err(AllocationError::ArithmeticOverflow);
+                        }
                     } else {
-                        return Err(AllocationError::ArithmeticOverflow);
+                        realloc(self.ptr.as_ptr() as *mut u8, layout, new_size)
                     }
-                } else {
-                    realloc(self.ptr.as_ptr() as *mut u8, layout, new_size)
+                }
+                None => {
+                    let layout = Layout::array::<T>(new_capacity)
+                        .map_err(|_| AllocationError::ArithmeticOverflow)?;
+
+                    if layout.size() > Self::MAX_SLICE_BYTE_LEN {
+                        if Self::MAX_SLICE_BYTE_LEN >= required_capacity {
+                            let layout = Layout::array::<T>(Self::MAX_SLICE_BYTE_LEN)
+                                .map_err(|_| AllocationError::ArithmeticOverflow)?;
+                            alloc(layout)
+                        } else {
+                            return Err(AllocationError::ArithmeticOverflow);
+                        }
+                    } else {
+                        alloc(layout)
+                    }
                 }
             }
         };
@@ -520,13 +525,17 @@ impl<T> HeapContainer<T> {
     }
 
     #[inline]
-    fn current_layout(&self) -> Layout {
-        // SAFETY: should not overflow because if it would, we could not have allocated it
-        unsafe {
-            Layout::from_size_align_unchecked(
-                mem::size_of::<T>() * self.capacity,
-                mem::align_of::<T>(),
-            )
+    fn current_layout(&self) -> Option<Layout> {
+        if mem::size_of::<T>() == 0 || self.capacity == 0 {
+            None
+        } else {
+            // SAFETY: should not overflow because if it would, we could not have allocated it
+            unsafe {
+                Some(Layout::from_size_align_unchecked(
+                    mem::size_of::<T>() * self.capacity,
+                    mem::align_of::<T>(),
+                ))
+            }
         }
     }
 }
@@ -632,9 +641,13 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
     }
 
     fn capacity(&self) -> usize {
-        match self.data {
-            DynamicData::Inline(_) => INLINE_SIZE,
-            DynamicData::Heap(ref container) => container.capacity,
+        if mem::size_of::<T>() == 0 {
+            usize::MAX
+        } else {
+            match self.data {
+                DynamicData::Inline(_) => INLINE_SIZE,
+                DynamicData::Heap(ref container) => container.capacity,
+            }
         }
     }
 
@@ -842,7 +855,7 @@ mod tests {
     extern crate std;
 
     use crate::{Container, CraneVec, DynVec, HeapVec, InlineContainer, InlineVec, Vec};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct PrintOnDrop {
         val: usize,
@@ -1158,5 +1171,72 @@ mod tests {
             assert_eq!(*i, 1);
         }
         assert_eq!(vec.iter().sum::<i32>(), 10);
+    }
+
+    std::thread_local! {
+        static DROP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        static RECORD_DROPS: AtomicBool = AtomicBool::new(false);
+    }
+
+    #[derive(Debug)]
+    struct ZeroSized {}
+
+    impl Drop for ZeroSized {
+        fn drop(&mut self) {
+            DROP_COUNTER.with(|counter| {
+                RECORD_DROPS.with(|record_drops| {
+                    if record_drops.load(Ordering::Relaxed) {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            });
+        }
+    }
+
+    impl PartialEq for ZeroSized {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_zero_sized_type() {
+        let inline_vec = InlineVec::<ZeroSized, 4>::new();
+
+        fn validate_vec<C>(mut vec: CraneVec<ZeroSized, C>)
+        where
+            C: Container<Element = ZeroSized>,
+        {
+            vec.push(ZeroSized {});
+            vec.push(ZeroSized {});
+            vec.push(ZeroSized {});
+            vec.push(ZeroSized {});
+            vec.push(ZeroSized {});
+            assert_eq!(vec.len(), 5);
+            assert_eq!(vec.capacity(), usize::MAX);
+            assert_eq!(vec[0], ZeroSized {});
+            assert_eq!(vec[4], ZeroSized {});
+            assert_eq!(vec.get(5), None);
+
+            for item in vec.iter() {
+                assert_eq!(*item, ZeroSized {});
+            }
+
+            RECORD_DROPS.with(|record_drops| record_drops.store(true, Ordering::Relaxed));
+            drop(vec);
+            DROP_COUNTER.with(|counter| {
+                assert_eq!(counter.load(Ordering::Relaxed), 5);
+                counter.store(0, Ordering::Relaxed);
+            });
+            RECORD_DROPS.with(|record_drops| record_drops.store(false, Ordering::Relaxed));
+        }
+
+        validate_vec(inline_vec);
+
+        let heap_vec = HeapVec::<ZeroSized>::new();
+        validate_vec(heap_vec);
+
+        let dyn_vec = DynVec::<ZeroSized, 4>::new();
+        validate_vec(dyn_vec);
     }
 }
