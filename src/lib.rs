@@ -684,8 +684,8 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
             usize::MAX
         } else {
             match self.data {
-                DynamicData::Inline(_) => INLINE_SIZE,
-                DynamicData::Heap(ref container) => container.capacity,
+                DynamicData::Inline(ref container) => container.capacity(),
+                DynamicData::Heap(ref container) => container.capacity(),
             }
         }
     }
