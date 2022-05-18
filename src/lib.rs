@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(feature = "dropck_eyepatch", feature(dropck_eyepatch))]
 
 extern crate alloc;
 
@@ -173,6 +174,8 @@ pub trait Container: DerefMut<Target = [Self::Element]> {
 pub struct InlineContainer<T, const SIZE: usize> {
     data: [MaybeUninit<T>; SIZE],
     len: usize,
+    #[cfg(feature = "dropck_eyepatch")]
+    _marker: core::marker::PhantomData<T>,
 }
 
 impl<T, const SIZE: usize> Container for InlineContainer<T, SIZE> {
@@ -264,7 +267,19 @@ impl<T, const SIZE: usize> Container for InlineContainer<T, SIZE> {
     }
 }
 
+#[cfg(not(feature = "dropck_eyepatch"))]
 impl<T, const SIZE: usize> Drop for InlineContainer<T, SIZE> {
+    fn drop(&mut self) {
+        unsafe {
+            let init = &mut *(slice::from_raw_parts_mut(self.data.as_mut_ptr(), self.len)
+                as *mut [MaybeUninit<T>] as *mut [T]);
+            ptr::drop_in_place(init);
+        }
+    }
+}
+
+#[cfg(feature = "dropck_eyepatch")]
+unsafe impl<#[may_dangle] T, const SIZE: usize> Drop for InlineContainer<T, SIZE> {
     fn drop(&mut self) {
         unsafe {
             let init = &mut *(slice::from_raw_parts_mut(self.data.as_mut_ptr(), self.len)
@@ -301,6 +316,8 @@ impl<T, const SIZE: usize> InlineContainer<T, SIZE> {
             // See (currently nightly) only [`uninit_array`](https://doc.rust-lang.org/stable/std/mem/union.MaybeUninit.html#method.uninit_array)
             data: unsafe { MaybeUninit::<[MaybeUninit<T>; SIZE]>::uninit().assume_init() },
             len: 0,
+            #[cfg(feature = "dropck_eyepatch")]
+            _marker: core::marker::PhantomData,
         }
     }
 }
@@ -309,6 +326,8 @@ pub struct HeapContainer<T> {
     ptr: NonNull<T>,
     capacity: usize,
     len: usize,
+    #[cfg(feature = "dropck_eyepatch")]
+    _marker: core::marker::PhantomData<T>,
 }
 
 impl<T> Container for HeapContainer<T> {
@@ -413,8 +432,20 @@ impl<T> Container for HeapContainer<T> {
     }
 }
 
-// TODO may_dangle?
+#[cfg(not(feature = "dropck_eyepatch"))]
 impl<T> Drop for HeapContainer<T> {
+    fn drop(&mut self) {
+        unsafe {
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len));
+            if let Some(layout) = self.current_layout() {
+                dealloc(self.ptr.as_ptr() as *mut u8, layout);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "dropck_eyepatch")]
+unsafe impl<#[may_dangle] T> Drop for HeapContainer<T> {
     fn drop(&mut self) {
         unsafe {
             ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len));
@@ -451,6 +482,18 @@ impl<T> HeapContainer<T> {
             ptr: NonNull::dangling(),
             capacity: 0,
             len: 0,
+            #[cfg(feature = "dropck_eyepatch")]
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    fn new_with_len(len: usize) -> Self {
+        HeapContainer {
+            ptr: NonNull::dangling(),
+            capacity: 0,
+            len,
+            #[cfg(feature = "dropck_eyepatch")]
+            _marker: core::marker::PhantomData,
         }
     }
 
@@ -563,12 +606,8 @@ impl<T, const INLINE_SIZE: usize> DynamicContainer<T, INLINE_SIZE> {
     fn move_inline_to_heap(
         container: &mut InlineContainer<T, INLINE_SIZE>,
     ) -> Result<HeapContainer<T>, AllocationError> {
-        let mut heap_container = HeapContainer {
-            ptr: NonNull::dangling(),
-            capacity: 0,
-            // pushing to inline container only fails when len reaches capacity
-            len: INLINE_SIZE,
-        };
+        // pushing to inline container only fails when len reaches capacity
+        let mut heap_container = HeapContainer::new_with_len(INLINE_SIZE);
 
         // make sure the data is reallocated to the heap and increase the capacity by at least 1
         heap_container.try_reserve_additional(cmp::max(INLINE_SIZE * 2, INLINE_SIZE + 1))?;
@@ -674,11 +713,7 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
                     .ok_or(AllocationError::ArithmeticOverflow)?;
 
                 if required_capacity > INLINE_SIZE {
-                    let mut heap_container = HeapContainer {
-                        ptr: NonNull::dangling(),
-                        capacity: 0,
-                        len: container.len,
-                    };
+                    let mut heap_container = HeapContainer::new_with_len(container.len);
 
                     heap_container.try_reserve(additional)?;
                     let heap_container =
@@ -702,11 +737,7 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
                     .ok_or(AllocationError::ArithmeticOverflow)?;
 
                 if required_capacity > INLINE_SIZE {
-                    let mut heap_container = HeapContainer {
-                        ptr: NonNull::dangling(),
-                        capacity: 0,
-                        len: container.len,
-                    };
+                    let mut heap_container = HeapContainer::new_with_len(container.len);
 
                     heap_container.try_reserve_exact(additional)?;
                     let heap_container =
@@ -724,11 +755,7 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
     fn try_reserve_additional(&mut self, additional_capacity: usize) -> AllocationResult {
         match self.data {
             DynamicData::Inline(ref mut container) => {
-                let mut heap_container = HeapContainer {
-                    ptr: NonNull::dangling(),
-                    capacity: 0,
-                    len: container.len,
-                };
+                let mut heap_container = HeapContainer::new_with_len(container.len);
 
                 heap_container.try_reserve_additional(INLINE_SIZE + additional_capacity)?;
                 let heap_container =
@@ -745,11 +772,7 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
     fn try_reserve_additional_exact(&mut self, additional_capacity: usize) -> AllocationResult {
         match self.data {
             DynamicData::Inline(ref mut container) => {
-                let mut heap_container = HeapContainer {
-                    ptr: NonNull::dangling(),
-                    capacity: 0,
-                    len: container.len,
-                };
+                let mut heap_container = HeapContainer::new_with_len(container.len);
 
                 heap_container.try_reserve_additional_exact(INLINE_SIZE + additional_capacity)?;
                 let heap_container =
@@ -1238,5 +1261,28 @@ mod tests {
 
         let dyn_vec = DynVec::<ZeroSized, 4>::new();
         validate_vec(dyn_vec);
+    }
+
+    #[cfg(feature = "dropck_eyepatch")]
+    #[test]
+    fn test_dropck_eyepatch() {
+        let mut x = 42;
+        let mut vec = Vec::new();
+        vec.push(&mut x);
+        std::println!("{:?}", x);
+
+        let mut x = 42;
+        let mut vec = DynVec::<_, 16>::new();
+        vec.push(&mut x);
+        std::println!("{:?}", x);
+
+        let mut x = 42;
+        let mut vec = HeapVec::new();
+        vec.push(&mut x);
+        std::println!("{:?}", x);
+
+        let mut vec = InlineVec::<_, 16>::new();
+        let mut x = 42;
+        vec.push(&mut x);
     }
 }
