@@ -47,6 +47,24 @@ impl<T> CraneVec<T, HeapContainer<T>> {
             container: HeapContainer::new(),
         }
     }
+
+    /// Deconstructs the given std Vec by leaking it and using its pointer to construct a new HeapVec,
+    /// meaning this function does not have to (re-)allocate anything and simply uses the std Vec's
+    /// allocated memory. This is safe since the provided Vec uses the same (Global) allocator.
+    pub fn from_std_vec(mut vec: alloc::vec::Vec<T>) -> Self {
+        let len = vec.len();
+        let capacity = vec.capacity();
+        let ptr = if vec.is_empty() {
+            NonNull::dangling()
+        } else {
+            // SAFETY: A non-empty Vec holds a valid pointer
+            unsafe { NonNull::new_unchecked(vec.as_mut_ptr()) }
+        };
+        vec.leak();
+        CraneVec {
+            container: HeapContainer { ptr, capacity, len },
+        }
+    }
 }
 
 impl<T, C: Container<Element = T>> Deref for CraneVec<T, C> {
@@ -66,6 +84,18 @@ impl<T, C: Container<Element = T>> DerefMut for CraneVec<T, C> {
 impl<T, const SIZE: usize> Default for CraneVec<T, DynamicContainer<T, SIZE>> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T: PartialEq, C: Container<Element = T>> PartialEq for CraneVec<T, C> {
+    fn eq(&self, other: &Self) -> bool {
+        *self.container == *other.container
+    }
+}
+
+impl<T: Debug, C: Container<Element = T>> Debug for CraneVec<T, C> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.container, f)
     }
 }
 
@@ -169,6 +199,112 @@ pub trait Container: DerefMut<Target = [Self::Element]> {
         self.try_reserve_additional_exact(additional_capacity)
             .expect("Could not allocate additional capacity")
     }
+
+    /// Update the length of this vector when changing its length outside of safe functions provided by this module.
+    /// Also used internally to update the length agnostic to the [`Container`] implementation.
+    ///
+    /// # Safety
+    /// Length must be <= capacity and must match the length of initialised elements [0..len]. When reducing
+    /// the length of the vector the caller needs to handle dropping elements [new_len..old_len] since the Drop implementations
+    /// for Containers generally use the length to subslice and drop initialised elements.
+    unsafe fn set_len(&mut self, len: usize);
+
+    /// Remove the element at the given index by copying all elements at [index + 1..len] to index, essentially
+    /// moving all elements after the provided index to the left by one. This has a worst case performance of
+    /// O(n) (linear time) when removing an item from the start of the vec but preserves the order of all other elements,
+    /// for an O(1) (constant time) implementation that does not preserve the order of elements see [`Container::try_swap_remove`].
+    ///
+    /// Returns the removed item or `None` if the index is out of bounds for [0..len].
+    ///
+    /// ```rust
+    /// use cranevec::HeapVec;
+    /// use crate::cranevec::Container;
+    /// let mut vec = HeapVec::from_std_vec(vec![1, 0, 9]);
+    /// assert_eq!(vec.try_remove(1), Some(0));
+    /// assert_eq!(vec.len(), 2);
+    /// assert_eq!(vec[0], 1);
+    /// assert_eq!(vec[1], 9);
+    /// assert_eq!(vec.try_remove(2), None);
+    ///
+    /// let mut alphabet = HeapVec::from_std_vec(vec!['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']);
+    /// assert_eq!(alphabet.try_remove(3), Some('d'));
+    /// assert_eq!(alphabet, HeapVec::from_std_vec(vec!['a', 'b', 'c', 'e', 'f', 'g', 'h', 'i', 'j']));
+    /// ```
+    fn try_remove(&mut self, index: usize) -> Option<Self::Element> {
+        let len = self.len();
+        if index >= len {
+            None
+        } else {
+            unsafe {
+                let ptr = self.as_mut_ptr().add(index);
+                let removed_el = ptr::read(ptr);
+                ptr::copy(ptr.offset(1), ptr, len - index - 1);
+                self.set_len(len - 1);
+                Some(removed_el)
+            }
+        }
+    }
+
+    /// Remove the element at the given index by copying all elements at [index + 1..len] to index, essentially
+    /// moving all elements after the provided index to the left by one. This has a worst case performance of
+    /// O(n) (linear time) when removing an item from the start of the vec but preserves the order of all other elements,
+    /// for an O(1) (constant time) implementation that does not preserve the order of elements see [`Container::try_swap_remove`].
+    ///
+    /// Returns the removed item or panics if the index is out of bounds for [0..len].
+    fn remove(&mut self, index: usize) -> Self::Element {
+        let result = self.try_remove(index);
+        assert!(
+            result.is_some(),
+            "Could not remove index {} for cranevec of length {}",
+            index,
+            self.len()
+        );
+        result.unwrap()
+    }
+
+    /// Remove the element at the given index by replacing it with the last item in the vector and reducing its length.
+    /// This always has a complexity of O(1) (constant time) but does not preserve the order of elements. For an
+    /// implementation that is O(n) (linear time) but preserves the order of elements see [`Container::try_remove`].
+    ///
+    /// Returns the removed item or `None` if the index is out of bounds for [0..len].
+    ///
+    /// ```rust
+    /// use cranevec::HeapVec;
+    /// use crate::cranevec::Container;
+    /// let mut vec = HeapVec::from_std_vec(vec!['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']);
+    /// assert_eq!(vec.try_swap_remove(3), Some('d'));
+    /// assert_eq!(vec, HeapVec::from_std_vec(vec!['a', 'b', 'c', 'j', 'e', 'f', 'g', 'h', 'i']));
+    /// ```
+    fn try_swap_remove(&mut self, index: usize) -> Option<Self::Element> {
+        let len = self.len();
+        if index >= len {
+            None
+        } else {
+            unsafe {
+                let removed_el = ptr::read(self.as_ptr().add(index));
+                let data_ptr = self.as_mut_ptr();
+                ptr::copy(data_ptr.add(len - 1), data_ptr.add(index), 1);
+                self.set_len(len - 1);
+                Some(removed_el)
+            }
+        }
+    }
+
+    /// Remove the element at the given index by replacing it with the last item in the vector and reducing its length.
+    /// This always has a complexity of O(1) (constant time) but does not preserve the order of elements. For an
+    /// implementation that is O(n) (linear time) but preserves the order of elements see [`Container::try_remove`].
+    ///
+    /// Returns the removed item or panics if the index is out of bounds for [0..len].
+    fn swap_remove(&mut self, index: usize) -> Self::Element {
+        let result = self.try_swap_remove(index);
+        assert!(
+            result.is_some(),
+            "Could not remove index {} for cranevec of length {}",
+            index,
+            self.len()
+        );
+        result.unwrap()
+    }
 }
 
 pub struct InlineContainer<T, const SIZE: usize> {
@@ -264,6 +400,10 @@ impl<T, const SIZE: usize> Container for InlineContainer<T, SIZE> {
         } else {
             Ok(())
         }
+    }
+
+    unsafe fn set_len(&mut self, len: usize) {
+        self.len = len;
     }
 }
 
@@ -429,6 +569,10 @@ impl<T> Container for HeapContainer<T> {
             .ok_or(AllocationError::ArithmeticOverflow)?;
 
         self.try_reserve_capacity(required_capacity, required_capacity)
+    }
+
+    unsafe fn set_len(&mut self, len: usize) {
+        self.len = len;
     }
 }
 
@@ -785,6 +929,13 @@ impl<T, const INLINE_SIZE: usize> Container for DynamicContainer<T, INLINE_SIZE>
             }
         }
     }
+
+    unsafe fn set_len(&mut self, len: usize) {
+        match self.data {
+            DynamicData::Inline(ref mut container) => container.len = len,
+            DynamicData::Heap(ref mut container) => container.len = len,
+        }
+    }
 }
 
 impl<T, const INLINE_SIZE: usize> Deref for DynamicContainer<T, INLINE_SIZE> {
@@ -876,6 +1027,8 @@ pub type InsertionResult<T> = Result<(), InsertionError<T>>;
 mod tests {
 
     extern crate std;
+
+    use alloc::vec;
 
     use crate::{Container, CraneVec, DynVec, HeapVec, InlineContainer, InlineVec, Vec};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1194,6 +1347,65 @@ mod tests {
             assert_eq!(*i, 1);
         }
         assert_eq!(vec.iter().sum::<i32>(), 10);
+    }
+
+    #[test]
+    fn test_partial_eq() {
+        let mut vec1 = Vec::new();
+        let mut vec2 = Vec::new();
+
+        vec1.push(1);
+        vec1.push(0);
+        vec1.push(9);
+        vec2.push(1);
+        vec2.push(0);
+        vec2.push(9);
+
+        assert_eq!(vec1, vec2);
+
+        let mut vec3 = Vec::new();
+        let mut vec4 = Vec::new();
+        let mut vec5 = Vec::new();
+
+        vec3.push(4);
+        vec3.push(5);
+        vec4.push(4);
+        vec4.push(6);
+        vec5.push(4);
+
+        assert!(vec3 != vec4);
+        assert!(vec3 != vec4);
+        assert!(vec4 != vec5);
+    }
+
+    #[test]
+    fn test_from_std_vec() {
+        let src = vec![1, 0, 9];
+        let capacity = src.capacity();
+        let mut vec = HeapVec::from_std_vec(src);
+        assert_eq!(vec.len(), 3);
+        assert_eq!(vec.capacity(), capacity);
+        assert_eq!(vec[0], 1);
+        assert_eq!(vec[1], 0);
+        assert_eq!(vec[2], 9);
+
+        for i in 0..20 {
+            vec.push(i);
+        }
+
+        for i in 0..20 {
+            assert_eq!(vec[i + 3], i);
+        }
+    }
+
+    #[test]
+    fn test_from_std_vec_dealloc() {
+        let mut counter = AtomicUsize::new(0);
+        let vec = HeapVec::from_std_vec(vec![IncrementOnDrop {
+            counter: &mut counter,
+        }]);
+        drop(vec);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
     std::thread_local! {
